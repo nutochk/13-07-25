@@ -54,6 +54,10 @@ func (server *HttpServer) addLink(c *gin.Context) {
 			c.String(http.StatusNotFound, err.Error())
 			return
 		}
+		if errors.Is(err, taskErrors.ErrOverload) {
+			c.String(http.StatusBadRequest, err.Error())
+			return
+		}
 		c.String(http.StatusInternalServerError, err.Error())
 		return
 	}
