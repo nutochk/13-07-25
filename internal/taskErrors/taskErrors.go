@@ -17,5 +17,3 @@ func (e TaskNotFoundError) Error() string {
 var ErrServerBusy = fmt.Errorf("server is busy")
 
 var ErrOverload = fmt.Errorf("task already has 3 files")
-
-var ErrAllFailed = fmt.Errorf("all downloads failed")

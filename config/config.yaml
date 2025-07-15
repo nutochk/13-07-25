@@ -5,3 +5,4 @@ file_types:
   - "image/jpeg"
 timeout: 10s
 max_file_size_mb: 10
+max_processing_tasks: 3

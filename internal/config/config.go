@@ -8,11 +8,12 @@ import (
 )
 
 type Config struct {
-	Port        int           `yaml:"port"`
-	Storage     string        `yaml:"storage"`
-	FileTypes   []string      `yaml:"file_types"`
-	Timeout     time.Duration `yaml:"timeout"`
-	MaxFileSize int           `yaml:"max_file_size_mb"`
+	Port               int           `yaml:"port"`
+	Storage            string        `yaml:"storage"`
+	FileTypes          []string      `yaml:"file_types"`
+	Timeout            time.Duration `yaml:"timeout"`
+	MaxFileSize        int           `yaml:"max_file_size_mb"`
+	MaxProcessingTasks int           `yaml:"max_processing_tasks"`
 }
 
 func NewConfig(path string) (*Config, error) {

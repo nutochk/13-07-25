@@ -26,24 +26,33 @@ type Service interface {
 type TaskService struct {
 	repo        repository.Repository
 	logger      *zap.Logger
-	MaxFileSize int64 // bytes
-	FileTypes   map[string]struct{}
-	Storage     string
-	Timeout     time.Duration
+	maxFileSize int64 // bytes
+	fileTypes   map[string]struct{}
+	storage     string
+	timeout     time.Duration
+	semaphore   chan struct{}
 }
 
 func NewTaskService(repo repository.Repository, logger *zap.Logger, cfg config.Config) *TaskService {
-	service := &TaskService{repo: repo, logger: logger, MaxFileSize: int64(cfg.MaxFileSize) * 1024 * 1024, Storage: cfg.Storage, Timeout: cfg.Timeout}
-	service.FileTypes = make(map[string]struct{})
+	service := &TaskService{repo: repo, logger: logger, maxFileSize: int64(cfg.MaxFileSize) * 1024 * 1024,
+		storage: cfg.Storage, timeout: cfg.Timeout}
+	service.fileTypes = make(map[string]struct{})
 	for _, t := range cfg.FileTypes {
-		service.FileTypes[t] = struct{}{}
+		service.fileTypes[t] = struct{}{}
 	}
+	service.semaphore = make(chan struct{}, cfg.MaxProcessingTasks)
 	return service
 }
 
 func (s *TaskService) CreateTask() (*models.TaskResponse, error) {
 	id := uuid.New()
+
+	if len(s.semaphore) == cap(s.semaphore) {
+		return nil, taskErrors.ErrServerBusy
+	}
+
 	task, err := s.repo.CreateTask(id)
+
 	if err != nil {
 		s.logger.Error("error create task", zap.Error(err))
 		return nil, err
@@ -58,26 +67,15 @@ func (s *TaskService) GetTask(id string) (*models.TaskResponse, error) {
 		s.logger.Error("error parse task id", zap.Error(err))
 		return nil, err
 	}
+
 	task, err := s.repo.GetTask(parsedId)
+
 	if err != nil {
 		s.logger.Error("error get task", zap.Any("id", id), zap.Error(err))
 		return nil, err
 	}
-	response := &models.TaskResponse{ID: task.ID}
-	if task.FileCount == 3 {
-		zipPath, errMessages, err := s.downloadToZip(task)
-		if err != nil {
-			s.logger.Error("error download zip", zap.Error(err))
-			return nil, err
-		}
-		response.Zip = zipPath
-		if errMessages != nil {
-			response.Status = models.StatusWithError
-		} else {
-			response.Status = models.StatusCompleted
-		}
-		response.ErrorMessages = errMessages
-	}
+	response := &models.TaskResponse{ID: task.ID, Status: task.Status, Zip: task.Zip, ErrorMessages: task.ErrorMessages}
+
 	return response, nil
 }
 
@@ -87,33 +85,59 @@ func (s *TaskService) AddLinkToTask(id string, url string) (*models.TaskResponse
 		s.logger.Error("error parse task id", zap.Error(err))
 		return nil, err
 	}
+
 	task, err := s.repo.AddLinkToTask(parsedId, url)
+
 	if err != nil {
 		s.logger.Error("error add link to task", zap.Any("id", id), zap.String("url", url), zap.Error(err))
 		return nil, err
 	}
+
+	if task.Status == models.StatusReady {
+		go s.downloadToZip(&task)
+	}
+
 	response := &models.TaskResponse{ID: task.ID, Status: task.Status}
 	return response, nil
 }
 
-func (s *TaskService) downloadToZip(task *models.Task) (string, []string, error) {
-	zipName := fmt.Sprintf("task_%s.zip", task.ID.String())
-	zipPath := filepath.Join(s.Storage, zipName)
+func (s *TaskService) downloadToZip(task *models.Task) {
+	s.semaphore <- struct{}{}
+	defer func() { <-s.semaphore }()
 
-	if err := os.MkdirAll(s.Storage, 0755); err != nil {
-		return "", nil, fmt.Errorf("failed to create storage directory: %v", err)
+	err := s.repo.UpdateTaskStatus(task.ID, models.StatusProcessing)
+	if err != nil {
+		s.logger.Error("error update task status", zap.Any("id", task.ID), zap.Error(err))
+		return
+	}
+
+	zipName := fmt.Sprintf("task_%s.zip", task.ID.String())
+	zipPath := filepath.Join(s.storage, zipName)
+
+	var errMessages []string
+	if err = os.MkdirAll(s.storage, 0755); err != nil {
+		errMessages = append(errMessages, fmt.Sprintf("failed to create storage directory: %v", err))
+		err = s.repo.UpdateTaskInfo(task.ID, "", errMessages)
+		if err != nil {
+			s.logger.Error("error update task info", zap.Any("id", task.ID), zap.Error(err))
+		}
+		return
 	}
 
 	zipFile, err := os.Create(zipPath)
 	if err != nil {
-		return "", nil, fmt.Errorf("failed to create archive file: %v", err)
+		errMessages = append(errMessages, fmt.Sprintf("failed to create zip file: %v", err))
+		err = s.repo.UpdateTaskInfo(task.ID, "", errMessages)
+		if err != nil {
+			s.logger.Error("error update task info", zap.Any("id", task.ID), zap.Error(err))
+		}
+		return
 	}
 	defer zipFile.Close()
 
 	zipWriter := zip.NewWriter(zipFile)
 	defer zipWriter.Close()
 
-	var errMessages []string
 	for _, link := range task.Links {
 		errMessage := s.downloadFile(link.URL, zipWriter)
 		if errMessage != "" {
@@ -123,13 +147,21 @@ func (s *TaskService) downloadToZip(task *models.Task) (string, []string, error)
 
 	if len(errMessages) == task.FileCount {
 		os.Remove(zipPath)
-		return "", errMessages, taskErrors.ErrAllFailed
+		err = s.repo.UpdateTaskInfo(task.ID, "", errMessages)
+		if err != nil {
+			s.logger.Error("error update task info", zap.Any("id", task.ID), zap.Error(err))
+		}
+		return
 	}
-	return zipPath, errMessages, nil
+
+	err = s.repo.UpdateTaskInfo(task.ID, zipPath, errMessages)
+	if err != nil {
+		s.logger.Error("error update task info", zap.Any("id", task.ID), zap.Error(err))
+	}
 }
 
 func (s *TaskService) downloadFile(url string, writer *zip.Writer) string {
-	client := http.Client{Timeout: s.Timeout}
+	client := http.Client{Timeout: s.timeout}
 
 	resp, err := client.Head(url)
 	if err != nil {
@@ -138,12 +170,12 @@ func (s *TaskService) downloadFile(url string, writer *zip.Writer) string {
 	defer resp.Body.Close()
 
 	contentType := resp.Header.Get("Content-Type")
-	if _, ok := s.FileTypes[contentType]; !ok {
+	if _, ok := s.fileTypes[contentType]; !ok {
 		return fmt.Sprintf("forbidden file type in %s", url)
 	}
 
-	if resp.ContentLength > s.MaxFileSize {
-		return fmt.Sprintf("more than max allowed file size (%d MB) in %s", s.MaxFileSize/(1024*1024), url)
+	if resp.ContentLength > s.maxFileSize {
+		return fmt.Sprintf("more than max allowed file size (%d MB) in %s", s.maxFileSize/(1024*1024), url)
 	}
 
 	resp, err = client.Get(url)
@@ -152,12 +184,14 @@ func (s *TaskService) downloadFile(url string, writer *zip.Writer) string {
 	}
 	defer resp.Body.Close()
 
-	fileName := fmt.Sprintf("file_%d%s", time.Now().UnixNano(), getFileExt(contentType, url))
+	fileName := fmt.Sprintf("file_%d%s", time.Now().UnixNano(), getFileExt(contentType))
 	zipFile, err := writer.Create(fileName)
 	if err != nil {
 		return fmt.Sprintf("failed to create file from %s in zip: %v", url, err)
 
 	}
+
+	time.Sleep(1 * time.Minute)
 
 	if _, err = io.Copy(zipFile, resp.Body); err != nil {
 		return fmt.Sprintf("failed to save file from %s in zip: %v", url, err)
@@ -165,7 +199,7 @@ func (s *TaskService) downloadFile(url string, writer *zip.Writer) string {
 	return ""
 }
 
-func getFileExt(ct string, url string) string {
+func getFileExt(ct string) string {
 	switch ct {
 	case "image/jpeg":
 		return ".jpg"

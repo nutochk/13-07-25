@@ -1,6 +1,7 @@
 package repository
 
 import (
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -9,12 +10,15 @@ import (
 )
 
 type Repository interface {
-	CreateTask(id uuid.UUID) (*models.Task, error)
-	GetTask(id uuid.UUID) (*models.Task, error)
-	AddLinkToTask(id uuid.UUID, url string) (*models.Task, error)
+	CreateTask(id uuid.UUID) (models.Task, error)
+	GetTask(id uuid.UUID) (models.Task, error)
+	AddLinkToTask(id uuid.UUID, url string) (models.Task, error)
+	UpdateTaskStatus(id uuid.UUID, status models.TaskStatus) error
+	UpdateTaskInfo(id uuid.UUID, path string, errs []string) error
 }
 
 type TaskRepository struct {
+	mu    sync.RWMutex
 	tasks map[uuid.UUID]*models.Task
 }
 
@@ -24,10 +28,10 @@ func NewTaskRepository() *TaskRepository {
 	}
 }
 
-func (tr *TaskRepository) CreateTask(id uuid.UUID) (*models.Task, error) {
-	if len(tr.tasks) >= 3 {
-		return nil, taskErrors.ErrServerBusy
-	}
+func (tr *TaskRepository) CreateTask(id uuid.UUID) (models.Task, error) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+
 	task := &models.Task{
 		ID:        id,
 		Status:    models.StatusPending,
@@ -37,30 +41,66 @@ func (tr *TaskRepository) CreateTask(id uuid.UUID) (*models.Task, error) {
 	}
 
 	tr.tasks[id] = task
-	return task, nil
+	return *task, nil
 }
 
-func (tr *TaskRepository) GetTask(id uuid.UUID) (*models.Task, error) {
+func (tr *TaskRepository) GetTask(id uuid.UUID) (models.Task, error) {
+	tr.mu.RLock()
+	defer tr.mu.RUnlock()
 	task, exists := tr.tasks[id]
 	if !exists {
-		return nil, taskErrors.TaskNotFoundError{ID: id}
+		return models.Task{}, taskErrors.TaskNotFoundError{ID: id}
 	}
-	return task, nil
+	return *task, nil
 }
 
-func (tr *TaskRepository) AddLinkToTask(id uuid.UUID, url string) (*models.Task, error) {
+func (tr *TaskRepository) AddLinkToTask(id uuid.UUID, url string) (models.Task, error) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
 	task, exists := tr.tasks[id]
 	if !exists {
-		return nil, taskErrors.TaskNotFoundError{ID: id}
+		return models.Task{}, taskErrors.TaskNotFoundError{ID: id}
 	}
 	if task.FileCount == 3 {
-		return nil, taskErrors.ErrOverload
+		return models.Task{}, taskErrors.ErrOverload
 	}
 	task.Links = append(task.Links, models.Link{URL: url})
 	task.FileCount++
-	if task.FileCount >= 3 {
+	if task.FileCount == 3 {
 		task.Status = models.StatusReady
 	}
-	tr.tasks[id] = task
-	return task, nil
+	return *task, nil
+}
+
+func (tr *TaskRepository) UpdateTaskStatus(id uuid.UUID, status models.TaskStatus) error {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+
+	task, exists := tr.tasks[id]
+	if !exists {
+		return taskErrors.TaskNotFoundError{ID: id}
+	}
+	task.Status = status
+	return nil
+}
+
+func (tr *TaskRepository) UpdateTaskInfo(id uuid.UUID, path string, errs []string) error {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+
+	task, exists := tr.tasks[id]
+	if !exists {
+		return taskErrors.TaskNotFoundError{ID: id}
+	}
+
+	if path != "" {
+		task.Zip = path
+	}
+	task.ErrorMessages = errs
+	if len(task.ErrorMessages) == 0 {
+		task.Status = models.StatusCompleted
+	} else {
+		task.Status = models.StatusWithError
+	}
+	return nil
 }
